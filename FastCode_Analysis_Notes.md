@@ -231,6 +231,59 @@ FastCode 端有 prompt token 截斷，但是 answer 生成階段，不是 Nanobo
 - `api.py` 和 `web_app.py` 有大量重複邏輯
 - 設計邊界不夠清晰（LLM 控制邏輯分散在多模組）
 
+### 6.6 索引過期與重構失真風險（高，實務上接近阻斷級） 🚨🚨🚨🚨🚨🚨
+
+這是目前最容易在真實 coding agent 場景中造成「看似可用、實際誤導」的缺陷之一。❗
+
+問題本質 🔍：
+
+- 系統索引（FAISS/BM25/Graph）是「一次建好後重用」的快照模型。
+- 目前沒有可靠的「查詢前過期檢測（stale check）」與「檔案級增量更新」機制。
+- 當 repo 發生大幅重構（搬移檔案、改目錄層級、rename symbol、切 branch）後，舊索引仍可能被直接載入。
+
+觀測到的結構性原因 ：
+
+- `index_repository(force=False)` 預設會優先嘗試讀取既有 cache/index，而不是先驗證工作樹是否變動。
+- `vector_store` / `BM25` / `graph` 的持久化採 repo 名稱覆蓋寫入，不具備 commit-aware 版本隔離。
+- `iterative_agent` 的工具層（例如 `list_directory` / `search_codebase`）可讀到磁碟最新結構，但後續元素對齊仍依賴舊 `bm25_elements`；形成「新檔案可見、舊索引語義」的混合狀態。
+
+失效模式（Failure Modes） ：
+
+1. 路徑漂移（Path Drift）
+
+- 目錄搬移後，檢索仍偏向舊路徑與舊文件分群，回答引用位置過時。
+
+2. 符號漂移（Symbol Drift）
+
+- class/function rename 後，graph 與 BM25 關聯仍使用舊符號，導致追蹤鏈錯位。
+
+3. 結構漂移（Structure Drift）
+
+- 大型重構後依賴關係（import/call/inheritance）已改變，但 graph 仍是舊拓撲，造成錯誤關聯擴展。
+
+4. 混合視圖不一致（Hybrid Inconsistency）
+
+- 工具層看到「新世界」，索引層用「舊世界」，LLM 會把兩者拼成自洽但錯誤的敘述。
+
+5. 偽穩定性（False Confidence）
+
+- 系統能順利回覆不代表資料新鮮；在缺乏 stale gate 時，錯誤答案不一定伴隨錯誤訊號。
+
+影響評估 ：
+
+- 對 demo：中等（小改動時常被掩蓋）。
+- 對日常 agent coding：高（重構/多分支切換常見）。
+- 對 production：高到不可接受（可導致持續性錯誤建議與錯誤修改）。
+
+結論 ：
+
+- 目前 FastCode 在「repo 大幅變動後的資料新鮮度保證」上，仍屬原型級能力。
+- 若要進入可靠工程流程，至少需要：
+  1. query 前 stale check（git HEAD + dirty tree + manifest/hash）
+  2. stale 時強制阻擋或自動 reindex
+  3. commit-aware 索引命名與版本回切
+  4. 後續再做檔案級增量更新（非阻斷但高價值）
+
 ---
 
 ## 7. 「是不是只有 side-project 等級」的客觀定位
